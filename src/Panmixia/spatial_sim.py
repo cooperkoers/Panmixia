@@ -523,7 +523,7 @@ class LocationPopulationSimulator:
         #for frame_path in frames:
         #    os.remove(frame_path)
         #os.rmdir(temp_dir)
-        
+"""
 # example usage
 map = gpd.read_file('maps/Climate_Zones_-_DOE_Building_America_Program.shp')
 # select only texas and louisiana for faster plotting
@@ -536,6 +536,7 @@ print("Testing Random Population Initialization...")
 simulator = LocationPopulationSimulator(n0=200, n1=10, L=1000, mate_bias=1, map=map, plotting=False, gif_filename='spatial_simulation.gif')
 simulator.simulate(generations=10)
 
+"""
 """
 print("Testing Gaussian Population Initialization...")
 

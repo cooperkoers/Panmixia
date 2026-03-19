@@ -255,7 +255,3 @@ class NaivePopulationSimulator:
                     for frame_path in frames:
                         os.remove(frame_path)
                     os.rmdir(temp_dir)
-
-# Run the simulation
-simulator = NaivePopulationSimulator(n0=200, n1=10, L=1000, mate_bias=1, plotting=False)
-simulator.simulate(generations=40)
