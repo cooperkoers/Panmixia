@@ -183,16 +183,6 @@ class LocationPopulationSimulator:
             self.population = self.gaussian_populate()
 
     def gaussian_populate(self) -> List[SpatialIndividual]:
-        """
-        Mixed initialization:
-
-        n0 -> uniformly random individuals with ZERO ancestry
-        n1 -> Gaussian-process spatial placement of FULL red-wolf founders
-
-        Returns:
-        - List of SpatialIndividual objects representing the initial population
-        """
-
         rng = np.random.default_rng()
 
         land_geom = self.map.geometry.union_all()
@@ -203,16 +193,26 @@ class LocationPopulationSimulator:
         # =====================================================
         # PART 1 — RANDOM COYOTES (ancestry = 0)
         # =====================================================
-        zero_points = []
+        n_samples = self.n0 * 10
+        lon = rng.uniform(xmin, xmax, n_samples)
+        lat = rng.uniform(ymin, ymax, n_samples)
 
         points = gpd.GeoDataFrame(
             geometry=[Point(x, y) for x, y in zip(lon, lat)],
             crs=self.map.crs
         )
 
-        mask = points.within(land_geom)  # vectorized
+        mask = points.within(land_geom)
         valid_points = points[mask]
-        zero_points = zero_points[:self.n0]
+
+        if len(valid_points) < self.n0:
+            raise ValueError(
+                f"Not enough valid land points sampled for n0={self.n0}. "
+                f"Try increasing the oversample factor."
+            )
+
+        valid_points = valid_points.iloc[:self.n0]
+        zero_points = [(geom.x, geom.y) for geom in valid_points.geometry]
 
         zero_genomes = make_initial_population(self.n0, self.L, ancestry=0)
 
@@ -220,102 +220,75 @@ class LocationPopulationSimulator:
             population.append(SpatialIndividual(genome, loc))
 
         # =====================================================
-        # PART 2 — RED WOLF FOUNDERS VIA GAUSSIAN PROCESS
+        # PART 2 — RED WOLF FOUNDERS
+        # locations: jittered around given points
+        # ancestry: assigned from GP surface
         # =====================================================
         if self.n1 > 0:
-
             if self.initial_populations is None:
                 raise ValueError("initial_populations required for gaussian mode")
 
-            # -----------------------------
-            # TRAIN GP
-            # -----------------------------
             X = self.initial_populations[["longitude", "latitude"]].values
             y = self.initial_populations["ancestry"].values
 
-            # normalize coordinates (ESSENTIAL)
+            # -----------------------------
+            # TRAIN GP (for ancestry values)
+            # -----------------------------
             self.x_mean = X.mean(axis=0)
             self.x_std = X.std(axis=0)
-
             X_scaled = (X - self.x_mean) / self.x_std
 
-            kernel = RBF(
-                length_scale=1.0,
-                length_scale_bounds=(0.01, 20.0)
-            )
-
+            kernel = RBF(length_scale=1.0, length_scale_bounds=(0.01, 20.0))
             gp = GaussianProcessRegressor(
                 kernel=kernel,
                 alpha=0.05,
                 normalize_y=True,
                 n_restarts_optimizer=5
             )
-
             gp.fit(X_scaled, y)
 
             # -----------------------------
-            # BUILD LAND GRID
+            # PLACE FOUNDERS near seed points, assign ancestry from GP
             # -----------------------------
-            lon_grid = np.linspace(xmin, xmax, 150)
-            lat_grid = np.linspace(ymin, ymax, 150)
-            LON, LAT = np.meshgrid(lon_grid, lat_grid)
+            jitter_scale = 0.3  # ~20 miles, tune to tighten/loosen
 
-            grid_points = np.column_stack([LON.ravel(), LAT.ravel()])
-
-            mask = np.array([
-                land_geom.contains(Point(x, y))
-                for x, y in grid_points
-            ])
-
-            valid_points = grid_points[mask]
-
-            # scale prediction coordinates
-            valid_scaled = (valid_points - self.x_mean) / self.x_std
-
-            mean_vals = gp.predict(valid_scaled)
-
-            # rebuild full surface
-            surface = np.zeros(grid_points.shape[0])
-            surface[mask] = mean_vals
-            surface = surface.reshape(LON.shape)
-
-            # -----------------------------
-            # ADD SPATIALLY CORRELATED NOISE
-            # -----------------------------
-            noise = rng.normal(size=surface.shape)
-            noise = gaussian_filter(noise, sigma=8)
-            noise /= np.std(noise)
-
-            surface += 0.1 * noise
-
-            # normalize safely
-            surface -= np.nanmin(surface)
-            surface /= np.nanmax(surface)
-
-            surface[~mask.reshape(LON.shape)] = 0
-
-            # -----------------------------
-            # SAMPLE FOUNDER LOCATIONS
-            # -----------------------------
-            prob = surface.ravel()
-            prob /= prob.sum()
-
-            idx = rng.choice(prob.size, size=self.n1, p=prob)
-
-            sim_lon = LON.ravel()[idx]
-            sim_lat = LAT.ravel()[idx]
-
-            # -----------------------------
-            # CREATE RED WOLF FOUNDERS
-            # -----------------------------
             founder_genomes = make_initial_population(self.n1, self.L, ancestry=1)
 
-            for genome, lon, lat in zip(founder_genomes, sim_lon, sim_lat):
-                population.append(
-                    SpatialIndividual(
-                        genome,
-                        (lon, lat)
-                    )
+            placed = 0
+            attempts = 0
+            max_attempts = self.n1 * 100
+
+            while placed < self.n1 and attempts < max_attempts:
+                # pick a random seed point weighted by ancestry
+                weights = y / y.sum()
+                seed_idx = rng.choice(len(X), p=weights)
+                seed = X[seed_idx]
+
+                dx = rng.normal(0, jitter_scale)
+                dy = rng.normal(0, jitter_scale)
+                candidate = Point(seed[0] + dx, seed[1] + dy)
+
+                if land_geom.contains(candidate):
+                    # predict ancestry at this location from GP
+                    loc = np.array([[candidate.x, candidate.y]])
+                    loc_scaled = (loc - self.x_mean) / self.x_std
+                    predicted_ancestry = float(np.clip(gp.predict(loc_scaled)[0], 0, 1))
+
+                    # build genome reflecting predicted ancestry
+                    genome = founder_genomes[placed].copy()
+                    n_wolf_loci = int(predicted_ancestry * self.L)
+                    genome[0] = np.array([1]*n_wolf_loci + [0]*(self.L - n_wolf_loci), dtype=np.int8)
+                    genome[1] = np.array([1]*n_wolf_loci + [0]*(self.L - n_wolf_loci), dtype=np.int8)
+
+                    population.append(SpatialIndividual(genome, (candidate.x, candidate.y)))
+                    placed += 1
+
+                attempts += 1
+
+            if placed < self.n1:
+                raise ValueError(
+                    f"Only placed {placed}/{self.n1} founders within land bounds "
+                    f"after {max_attempts} attempts. Try increasing jitter_scale."
                 )
 
         return population
@@ -332,7 +305,7 @@ class LocationPopulationSimulator:
         ancestries = [ind.get_ancestry() for ind in self.population]
         scatter = plt.scatter(x_coords, y_coords, c=ancestries, cmap='viridis', alpha=0.7)
         plt.colorbar(scatter, label='Ancestry')
-        plt.title('Spatial Distribution of Population Ancestry')
+        plt.title('Spatial Ancestry Distribution')
         plt.xlabel('Longitude')
         plt.ylabel('Latitude')
         plt.show()
@@ -492,7 +465,7 @@ class LocationPopulationSimulator:
                         # set y axis limits for consistency
                         plt.ylim(0, len(self.population) // 2)
                         plt.hist(ancestries, bins=20, alpha=0.7)
-                        plt.title(f'Generation {gen+1} Ancestry Distribution')
+                        plt.title(f'Generation {gen+1} Distribution')
                         plt.xlabel('Ancestry')
                         plt.ylabel('Frequency')
                         
@@ -508,7 +481,7 @@ class LocationPopulationSimulator:
                         ancestries = [ind.get_ancestry() for ind in self.population]
                         scatter = plt.scatter(x_coords, y_coords, c=ancestries, cmap='viridis', alpha=0.7)
                         plt.colorbar(scatter, label='Ancestry')
-                        plt.title(f'Spatial Distribution of Population Ancestry - Generation {gen+1}')
+                        plt.title(f'Generation {gen+1}')
                         plt.xlabel('Longitude')
                         plt.ylabel('Latitude')
                         plt.show()
